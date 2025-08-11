@@ -185,7 +185,7 @@ async function saveUserPreferences(chatId, prefs) {
 async function chatWithGemini(messages) { 
     try { 
         const completion = await openai.chat.completions.create({ 
-            model: process.env.GEMINI_MODEL || 'models/gemini-2.5-pro', 
+            model: process.env.GEMINI_MODEL || 'models/gemini-1.5-pro-latest', 
             messages: messages, 
             temperature: 0.6, 
         }); 
@@ -202,15 +202,12 @@ async function chatWithGemini(messages) {
 } 
  
 async function textToSpeech(text, chatId) { 
-    // Esta verificación es redundante ya que se comprueba antes de llamar a esta función,
-    // pero la mantenemos por seguridad
     if (!TTS_API_BASE_URL || !TTS_API_TOKEN) {
         console.log('⚠️ TTS no configurado. Omitiendo conversión de texto a voz.');
         return null;
     }
     
-    // Limitar el texto a un tamaño razonable para evitar errores
-    const MAX_TTS_LENGTH = 100000; // 100,000 caracteres
+    const MAX_TTS_LENGTH = 100000;
     if (text.length > MAX_TTS_LENGTH) {
         console.log(`⚠️ Texto demasiado largo para TTS (${text.length} caracteres). Truncando a ${MAX_TTS_LENGTH} caracteres.`);
         text = text.substring(0, MAX_TTS_LENGTH) + '...';
@@ -322,26 +319,52 @@ async function startBot() {
  
     sock.ev.on('creds.update', saveCreds); 
  
-    sock.ev.on('connection.update', (update) => { 
-        const { connection, lastDisconnect, qr } = update; 
-        if (qr) { 
-            console.log('------------------------------------------------'); 
-            console.log('🔐 Escanea el código QR con tu móvil para conectar:'); 
-            qrcode.generate(qr, { small: true }); 
-            console.log('------------------------------------------------'); 
-        } 
-        if(connection === 'close') { 
-            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut; 
-            console.log('❌ Conexión cerrada por: ', lastDisconnect.error, ', reconectando: ', shouldReconnect); 
-            if(shouldReconnect) { 
-                startBot(); 
-            } else { 
-                console.log('❌ Conexión cerrada permanentemente. Borra la carpeta "auth-data-baileys" y reinicia.'); 
-            } 
-        } else if(connection === 'open') { 
-            console.log('✅ Bot Agente-Gemini v2.1 (Baileys) listo y conectado ✅'); 
-        } 
-    }); 
+    // ▼▼▼ INICIO DE LA SECCIÓN MODIFICADA ▼▼▼
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log('------------------------------------------------');
+            console.log('🔐 Escanea el código QR con tu móvil para conectar:');
+            qrcode.generate(qr, { small: true });
+            console.log('------------------------------------------------');
+        }
+
+        if (connection === 'open') {
+            console.log('✅ Bot Agente-Gemini v2.1 (Baileys) listo y conectado ✅');
+        }
+
+        if (connection === 'close') {
+            const lastDisconnectError = lastDisconnect?.error;
+            const statusCode = (lastDisconnectError instanceof Boom) ? lastDisconnectError.output.statusCode : 500;
+            
+            // Comprobamos si el error es 'loggedOut'
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('🚫 Conexión cerrada: La sesión ha sido cerrada (loggedOut).');
+                console.log('🗑️ Eliminando la carpeta de sesión para forzar una nueva vinculación...');
+                
+                try {
+                    // Eliminamos la carpeta de autenticación de forma síncrona
+                    if (fs.existsSync(authDir)) {
+                        fs.rmSync(authDir, { recursive: true, force: true });
+                        console.log('📁 Carpeta de sesión eliminada exitosamente.');
+                    }
+                } catch (err) {
+                    console.error('❌ Error al eliminar la carpeta de sesión:', err);
+                }
+
+                console.log('🔄 Reiniciando el proceso del bot para generar un nuevo código QR...');
+                // Volvemos a llamar a startBot() para que inicie de cero
+                startBot();
+
+            } else {
+                // Para cualquier otro tipo de error, intentamos reconectar
+                console.log(`❌ Conexión cerrada. Error: ${lastDisconnectError?.message || 'Desconocido'}. Intentando reconectar...`);
+                startBot();
+            }
+        }
+    });
+    // ▲▲▲ FIN DE LA SECCIÓN MODIFICADA ▲▲▲
  
     sock.ev.on('messages.upsert', async (m) => { 
         const msg = m.messages[0]; 
@@ -391,7 +414,6 @@ async function startBot() {
             } 
  
             if (body.toLowerCase() === '/modelos' || body.toLowerCase() === '/voices') { 
-                // Verificar si el sistema de voz está configurado
                 if (!TTS_API_BASE_URL || !TTS_API_TOKEN) {
                     await sock.sendMessage(chatId, { text: 'El sistema de voz no está configurado en este servidor. No se pueden obtener modelos de voz.' });
                     return;
@@ -479,7 +501,6 @@ async function startBot() {
                 finalReply = "Lo siento, no pude procesar tu solicitud después de varios intentos. Por favor, intenta reformular tu pregunta."; 
             } 
             
-            // Procesar la respuesta final para asegurar que sea legible en WhatsApp
             finalReply = removeMarkdown(finalReply);
             
             try {
@@ -492,7 +513,6 @@ async function startBot() {
                 }
             } catch (error) {
                 console.error('❌ Error al enviar mensaje de texto:', error);
-                // Intentar enviar un mensaje nuevo si falló la edición
                 try {
                     await sock.sendMessage(chatId, { text: finalReply });
                     console.log(`💬 Mensaje enviado como nuevo tras error de edición a ${chatId}`);
@@ -502,14 +522,12 @@ async function startBot() {
             } 
  
             if (finalReply) { 
-                // Actualizar el historial de conversación
                 permanentHistory.push({ role: 'user', content: body }); 
                 permanentHistory.push({ role: 'assistant', content: finalReply }); 
                 if (permanentHistory.length > 20) permanentHistory.splice(0, permanentHistory.length - 20); 
                 await setHistory(chatId, permanentHistory); 
                 console.log("💾 Historial de conversación permanente actualizado."); 
                 
-                // Generar y enviar audio solo si las variables de entorno están definidas
                 if (TTS_API_BASE_URL && TTS_API_TOKEN) {
                     try {
                         const audioBuffer = await textToSpeech(finalReply, chatId); 
@@ -523,7 +541,6 @@ async function startBot() {
                                 console.log(`🎤 Audio enviado a ${chatId}`); 
                             } catch (audioSendError) {
                                 console.error('❌ Error al enviar audio:', audioSendError.message);
-                                // Intentar enviar un mensaje de texto informando del error
                                 try {
                                     await sock.sendMessage(chatId, { 
                                         text: "No pude enviarte un mensaje de voz, pero puedes leer mi respuesta arriba." 
